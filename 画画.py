@@ -42,7 +42,8 @@ class AppConfig:
     def _load_config(self) -> Dict[str, Any]:
         defaults = {
             '视频帧率': 30,
-            '生成视频': True
+            '生成视频': True,
+            '视频质量': '1080P'
         }
         if self.config_path.exists():
             try:
@@ -105,7 +106,9 @@ class BitmapSimulator:
 
         video_out = None
         if self.config['生成视频']:
-            vw, vh = (w, h) if max(w, h) <= 1080 else (int(w * 1080/max(w,h)), int(h * 1080/max(w,h)))
+            q_map = {'4K': 2160, '2K': 1440, '1080P': 1080, '720P': 720}
+            target_h = q_map.get(self.config['视频质量'], 1080)
+            vw, vh = (w, h) if h <= target_h else (int(w * target_h / h), target_h)
             video_out = cv2.VideoWriter(PREVIEW_VIDEO_NAME, cv2.VideoWriter_fourcc(*'mp4v'), self.config['视频帧率'], (vw, vh))
 
         total_layers = len(layers)
@@ -124,7 +127,13 @@ class BitmapSimulator:
             sys.stdout.write(f"\r生成进度: {((idx+1) / total_layers) * 100:.1f}%")
             sys.stdout.flush()
 
-        if video_out: video_out.release()
+        if video_out:
+            last_frame = cv2.cvtColor(canvas_np, cv2.COLOR_RGB2BGR)
+            if last_frame.shape[1] != vw or last_frame.shape[0] != vh:
+                last_frame = cv2.resize(last_frame, (vw, vh))
+            for _ in range(int(self.config['视频帧率'])):
+                video_out.write(last_frame)
+            video_out.release()
 
         final_img = Image.fromarray(canvas_np)
         final_img.save(PREVIEW_IMG_NAME)
@@ -142,6 +151,7 @@ class BitmapSimulator:
             print("-" * 50)
             print(f"1. 视频开关:     {'[开启]' if self.config['生成视频'] else '[关闭]'}")
             print(f"2. 视频帧率:     {self.config['视频帧率']} FPS")
+            print(f"3. 视频质量:     {self.config['视频质量']} (4K/2K/1080P/720P)")
             print("-" * 50)
             print(f"当前图片: {Path(curr_p).name}")
             print(" [A] 开始画图   [B] 重新选图   [C] 保存设置   [D] 退出程序")
@@ -166,6 +176,9 @@ class BitmapSimulator:
             elif c == '2':
                 val = input("请输入 FPS (1-60): ")
                 if val.isdigit(): self.config['视频帧率'] = int(val)
+            elif c == '3':
+                val = input("请输入质量 (4K/2K/1080P/720P): ").upper()
+                if val in ['4K', '2K', '1080P', '720P']: self.config['视频质量'] = val
 
 if __name__ == "__main__":
     import tkinter as tk
