@@ -1,22 +1,16 @@
 # -*- coding: utf-8 -*-
-import os
-import sys
-import json
-import time
-import logging
-import subprocess
-from pathlib import Path
-from typing import Any, Dict, List
+import os, sys, json, time, subprocess, cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from pathlib import Path
+from PIL import Image
 
 def bootstrap():
-    required_libs = ["pillow", "numpy", "opencv-python"]
+    libs = ["pillow", "numpy", "opencv-python"]
     try:
         import PIL, numpy, cv2
     except ImportError:
         print("\n[信息] 正在同步依赖")
-        for lib in required_libs:
+        for lib in libs:
             subprocess.run([sys.executable, "-m", "pip", "install", lib, "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], capture_output=True)
         print("[完成] 环境就绪\n")
         os.execv(sys.executable, ['python'] + sys.argv)
@@ -25,167 +19,126 @@ if __name__ == "__main__" and "SKIP_BOOT" not in os.environ:
     os.environ["SKIP_BOOT"] = "1"
     bootstrap()
 
-import cv2
+class Config:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = self._load()
 
-CONFIG_FILE = 'zyf_config.json'
-PREVIEW_IMG_NAME = "预览图.png"
-PREVIEW_VIDEO_NAME = "视频回放.mp4"
-
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s', datefmt='%H:%M:%S')
-logger = logging.getLogger(__name__)
-
-class AppConfig:
-    def __init__(self, config_path: str):
-        self.config_path = Path(config_path)
-        self.settings = self._load_config()
-
-    def _load_config(self) -> Dict[str, Any]:
-        defaults = {
-            '视频帧率': 30,
-            '生成视频': True,
-            '视频质量': '1080P'
-        }
-        if self.config_path.exists():
+    def _load(self):
+        base = {'帧率': 30, '视频': True, '质量': '1080P'}
+        if self.path.exists():
             try:
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    for k, v in data.items():
-                        if k in defaults: defaults[k] = v
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    user = json.load(f)
+                    base.update({k: v for k, v in user.items() if k in base})
             except: pass
-        return defaults
+        return base
 
-    def save_config(self):
+    def save(self):
         try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, ensure_ascii=False, indent=2)
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
             print("设置已保存")
         except: pass
 
-    def __getitem__(self, key: str) -> Any: return self.settings.get(key)
-    def __setitem__(self, key: str, value: Any): self.settings[key] = value
+    def __getitem__(self, k): return self.data.get(k)
+    def __setitem__(self, k, v): self.data[k] = v
 
-class BitmapSimulator:
+class Painter:
     def __init__(self):
-        self.config = AppConfig(CONFIG_FILE)
+        self.cfg = Config('zyf_config.json')
 
-    def extract_bitmap_layers(self, image_path: str):
-        logger.info("提取数据中")
-        img_src = Image.open(image_path).convert('RGB')
-        w, h = img_src.size
+    def _init_video(self, w, h):
+        if not self.cfg['视频']: return None, 0, 0
+        dims = {'4K': 2160, '2K': 1440, '1080P': 1080, '720P': 720}
+        th = dims.get(self.cfg['质量'], 1080)
+        vw, vh = (w, h) if h <= th else (int(w * th / h), th)
+        out = cv2.VideoWriter("视频回放.mp4", cv2.VideoWriter_fourcc(*'mp4v'), self.cfg['帧率'], (vw, vh))
+        return out, vw, vh
 
-        pixels_rgb = np.array(img_src)
+    def _write_frame(self, out, img, vw, vh):
+        if not out: return
+        f = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if f.shape[1] != vw or f.shape[0] != vh: f = cv2.resize(f, (vw, vh))
+        out.write(f)
 
-        flat_pixels = pixels_rgb.reshape(-1, 3)
-        pixel_ints = flat_pixels[:,0].astype(np.uint32) << 16 | flat_pixels[:,1].astype(np.uint32) << 8 | flat_pixels[:,2].astype(np.uint32)
-        unique_ints, indices = np.unique(pixel_ints, return_inverse=True)
+    def run(self, path, mode='art'):
+        start_t = time.time()
+        src = Image.open(path).convert('RGB')
+        w, h = src.size
+        pix = np.array(src)
+        canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+        video, vw, vh = self._init_video(w, h)
 
-        u_r, u_g, u_b = (unique_ints >> 16) & 0xFF, (unique_ints >> 8) & 0xFF, unique_ints & 0xFF
-        valid_mask = (u_r.astype(int) + u_g + u_b) <= 750
+        if mode == 'art':
+            print("提取数据")
+            flat = pix.reshape(-1, 3)
+            uints = flat[:,0].astype(np.uint32) << 16 | flat[:,1].astype(np.uint32) << 8 | flat[:,2].astype(np.uint32)
+            unq, inv = np.unique(uints, return_inverse=True)
 
-        y_coords, x_coords = np.indices((h, w))
-        flat_y, flat_x = y_coords.ravel(), x_coords.ravel()
+            lums = 0.299 * ((unq >> 16) & 0xFF) + 0.587 * ((unq >> 8) & 0xFF) + 0.114 * (unq & 0xFF)
+            order = np.argsort(lums)
 
-        layers = []
-        for i, is_valid in enumerate(valid_mask):
-            if not is_valid: continue
-            color_mask = (indices == i)
-            pts = np.column_stack((flat_x[color_mask], flat_y[color_mask]))
-            layers.append({"color": (int(u_r[i]), int(u_g[i]), int(u_b[i])), "points": pts})
-            if i % 500 == 0:
-                sys.stdout.write(f"\r[分析] 提取进度: {i}/{len(unique_ints)} 色"); sys.stdout.flush()
+            flat_canvas = canvas.reshape(-1, 3)
+            total = len(unq)
+            for i, idx in enumerate(order):
+                c_int = unq[idx]
+                c_rgb = [(c_int >> 16) & 0xFF, (c_int >> 8) & 0xFF, c_int & 0xFF]
+                flat_canvas[inv == idx] = c_rgb
 
-        print(f"\n[完成] 分析完成 (分辨率: {w}x{h})")
-        return layers, (w, h)
+                if video and i % max(1, total // 100) == 0:
+                    self._write_frame(video, canvas, vw, vh)
+                if i % 100 == 0:
+                    sys.stdout.write(f"\r进度: {(i+1)/total*100:.1f}%"); sys.stdout.flush()
+        else:
+            print("提取数据")
+            step = max(1, h // 60)
+            for y in range(0, h, step):
+                ny = min(y + step, h)
+                canvas[y:ny, :] = pix[y:ny, :]
+                if video: self._write_frame(video, canvas, vw, vh)
+                sys.stdout.write(f"\r进度: {ny/h*100:.1f}%"); sys.stdout.flush()
 
-    def run_simulation(self, image_path: str):
-        layers, size = self.extract_bitmap_layers(image_path)
-        if not layers: return
-        w, h = size
+        if video:
+            for _ in range(self.cfg['帧率']): self._write_frame(video, canvas, vw, vh)
+            video.release()
+        Image.fromarray(canvas).save("预览图.png")
+        print(f"\n\n分析完成，耗时: {time.time()-start_t:.2f} 秒")
+        os.startfile("预览图.png")
+        if video: os.startfile("视频回放.mp4")
 
-        canvas_np = np.full((h, w, 3), 255, dtype=np.uint8)
-
-        video_out = None
-        if self.config['生成视频']:
-            q_map = {'4K': 2160, '2K': 1440, '1080P': 1080, '720P': 720}
-            target_h = q_map.get(self.config['视频质量'], 1080)
-            vw, vh = (w, h) if h <= target_h else (int(w * target_h / h), target_h)
-            video_out = cv2.VideoWriter(PREVIEW_VIDEO_NAME, cv2.VideoWriter_fourcc(*'mp4v'), self.config['视频帧率'], (vw, vh))
-
-        total_layers = len(layers)
-        print(f"[进度] 正在生成结果 (共 {total_layers} 个色)...")
-
-        for idx, l in enumerate(layers):
-            pts = l['points']
-            canvas_np[pts[:, 1], pts[:, 0]] = l['color']
-
-            if video_out and idx % max(1, total_layers // 100) == 0:
-                frame = cv2.cvtColor(canvas_np, cv2.COLOR_RGB2BGR)
-                if frame.shape[1] != vw or frame.shape[0] != vh:
-                    frame = cv2.resize(frame, (vw, vh))
-                video_out.write(frame)
-
-            sys.stdout.write(f"\r生成进度: {((idx+1) / total_layers) * 100:.1f}%")
-            sys.stdout.flush()
-
-        if video_out:
-            last_frame = cv2.cvtColor(canvas_np, cv2.COLOR_RGB2BGR)
-            if last_frame.shape[1] != vw or last_frame.shape[0] != vh:
-                last_frame = cv2.resize(last_frame, (vw, vh))
-            for _ in range(int(self.config['视频帧率'])):
-                video_out.write(last_frame)
-            video_out.release()
-
-        final_img = Image.fromarray(canvas_np)
-        final_img.save(PREVIEW_IMG_NAME)
-        print(f"\n\n[成功] 模拟完成！")
-        print(f"图片: {PREVIEW_IMG_NAME} ({w}x{h})")
-
-        os.startfile(PREVIEW_IMG_NAME)
-        if video_out: os.startfile(PREVIEW_VIDEO_NAME)
-
-    def main_menu(self, image_path: str):
-        curr_p = image_path
+    def menu(self, path):
+        curr = path
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print("qq3424025921")
-            print("-" * 50)
-            print(f"1. 视频开关:     {'[开启]' if self.config['生成视频'] else '[关闭]'}")
-            print(f"2. 视频帧率:     {self.config['视频帧率']} FPS")
-            print(f"3. 视频质量:     {self.config['视频质量']} (4K/2K/1080P/720P)")
-            print("-" * 50)
-            print(f"当前图片: {Path(curr_p).name}")
-            print(" [A] 开始画图   [B] 重新选图   [C] 保存设置   [D] 退出程序")
-
+            print(f"qq3424025921\n{'-'*50}")
+            print(f"1. 视频开关: {'[开启]' if self.cfg['视频'] else '[关闭]'}")
+            print(f"2. 视频帧率: {self.cfg['帧率']} FPS")
+            print(f"3. 视频质量: {self.cfg['质量']} (4K/2K/1080P/720P)")
+            print(f"{'-'*50}\n当前图片: {Path(curr).name}")
+            print(" [A] 直接渲染一   [R] 直接渲染二\n [B] 重新选图              [C] 保存设置   [D] 退出程序")
             c = input("\n指令: ").strip().upper()
-            if c == 'A':
-                self.run_simulation(curr_p)
-                input("\n按回车返回菜单")
+            if c == 'A': self.run(curr, 'art'); input("\n回车返回")
+            elif c == 'R': self.run(curr, 'fast'); input("\n回车返回")
             elif c == 'B':
                 import tkinter as tk
                 from tkinter import filedialog
                 root = tk.Tk(); root.withdraw()
-                new_p = filedialog.askopenfilename(title="选择图片")
-                if new_p: curr_p = new_p
-            elif c == 'C':
-                self.config.save_config()
-                time.sleep(1)
-            elif c == 'D':
-                sys.exit()
-            elif c == '1':
-                self.config['生成视频'] = not self.config['生成视频']
+                p = filedialog.askopenfilename()
+                if p: curr = p
+            elif c == 'C': self.cfg.save(); time.sleep(1)
+            elif c == 'D': break
+            elif c == '1': self.cfg['视频'] = not self.cfg['视频']
             elif c == '2':
-                val = input("请输入 FPS (1-60): ")
-                if val.isdigit(): self.config['视频帧率'] = int(val)
+                v = input("FPS (1-60): ")
+                if v.isdigit(): self.cfg['帧率'] = int(v)
             elif c == '3':
-                val = input("请输入质量 (4K/2K/1080P/720P): ").upper()
-                if val in ['4K', '2K', '1080P', '720P']: self.config['视频质量'] = val
+                v = input("质量 (4K/2K/1080P/720P): ").upper()
+                if v in ['4K', '2K', '1080P', '720P']: self.cfg['质量'] = v
 
 if __name__ == "__main__":
     import tkinter as tk
     from tkinter import filedialog
-
     root = tk.Tk(); root.withdraw()
     p = filedialog.askopenfilename(title="请选择图片")
-    if p:
-        sim = BitmapSimulator()
-        sim.main_menu(p)
+    if p: Painter().menu(p)
