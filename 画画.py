@@ -47,8 +47,10 @@ class Config:
 class Painter:
     def __init__(self):
         self.cfg = Config('zyf_config.json')
+        self.frame_cache = []
 
     def _init_video(self, w, h):
+        self.frame_cache = []
         if not self.cfg['视频']: return None, 0, 0
         dims = {'4K': 2160, '2K': 1440, '1080P': 1080, '720P': 720}
         th = dims.get(self.cfg['质量'], 1080)
@@ -56,11 +58,10 @@ class Painter:
         out = cv2.VideoWriter("视频回放.mp4", cv2.VideoWriter_fourcc(*'mp4v'), self.cfg['帧率'], (vw, vh))
         return out, vw, vh
 
-    def _write_frame(self, out, img, vw, vh):
-        if not out: return
+    def _write_frame(self, img, vw, vh):
         f = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         if f.shape[1] != vw or f.shape[0] != vh: f = cv2.resize(f, (vw, vh))
-        out.write(f)
+        self.frame_cache.append(f)
 
     def run(self, path, mode='art'):
         start_t = time.time()
@@ -79,28 +80,35 @@ class Painter:
             lums = 0.299 * ((unq >> 16) & 0xFF) + 0.587 * ((unq >> 8) & 0xFF) + 0.114 * (unq & 0xFF)
             order = np.argsort(lums)
 
-            flat_canvas = canvas.reshape(-1, 3)
-            total = len(unq)
-            for i, idx in enumerate(order):
-                c_int = unq[idx]
-                c_rgb = [(c_int >> 16) & 0xFF, (c_int >> 8) & 0xFF, c_int & 0xFF]
-                flat_canvas[inv == idx] = c_rgb
+            rank_map = np.zeros(len(unq), dtype=np.uint32)
+            rank_map[order] = np.arange(len(unq))
+            pixel_ranks = rank_map[inv]
+            sorted_pixel_indices = np.argsort(pixel_ranks)
 
-                if video and i % max(1, total // 100) == 0:
-                    self._write_frame(video, canvas, vw, vh)
-                if i % 100 == 0:
-                    sys.stdout.write(f"\r进度: {(i+1)/total*100:.1f}%"); sys.stdout.flush()
+            flat_canvas = canvas.reshape(-1, 3)
+            steps = 100
+            chunk_size = len(sorted_pixel_indices) // steps
+            for i in range(steps):
+                idx_slice = sorted_pixel_indices[i*chunk_size : (i+1)*chunk_size]
+                if i == steps - 1: idx_slice = sorted_pixel_indices[i*chunk_size:]
+
+                flat_canvas[idx_slice] = flat[idx_slice]
+
+                if video: self._write_frame(canvas, vw, vh)
+                sys.stdout.write(f"\r进度: {(i+1):.1f}%"); sys.stdout.flush()
         else:
             print("提取数据")
-            step = max(1, h // 60)
-            for y in range(0, h, step):
-                ny = min(y + step, h)
-                canvas[y:ny, :] = pix[y:ny, :]
-                if video: self._write_frame(video, canvas, vw, vh)
-                sys.stdout.write(f"\r进度: {ny/h*100:.1f}%"); sys.stdout.flush()
+            steps = 60
+            for i in range(steps):
+                y_start = int(i * h / steps)
+                y_end = int((i + 1) * h / steps)
+                canvas[y_start:y_end, :] = pix[y_start:y_end, :]
+                if video: self._write_frame(canvas, vw, vh)
+                sys.stdout.write(f"\r进度: {(i+1)/steps*100:.1f}%"); sys.stdout.flush()
 
         if video:
-            for _ in range(self.cfg['帧率']): self._write_frame(video, canvas, vw, vh)
+            for f in self.frame_cache: video.write(f)
+            for _ in range(self.cfg['帧率']): video.write(self.frame_cache[-1])
             video.release()
         Image.fromarray(canvas).save("预览图.png")
         print(f"\n\n分析完成，耗时: {time.time()-start_t:.2f} 秒")
