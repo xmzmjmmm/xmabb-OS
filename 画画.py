@@ -9,7 +9,7 @@ def bootstrap():
     try:
         import PIL, numpy, cv2
     except ImportError:
-        print("\n[信息] 正在同步依赖")
+        print("\n[初始化] 正在同步依赖")
         for lib in libs:
             subprocess.run([sys.executable, "-m", "pip", "install", lib, "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], capture_output=True)
         print("[完成] 环境就绪\n")
