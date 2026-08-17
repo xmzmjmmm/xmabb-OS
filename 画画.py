@@ -1,19 +1,19 @@
-# -*- coding: utf-8 -*-
 import os, sys, json, time, subprocess, cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image
 
 def bootstrap():
-    libs = ["pillow", "numpy", "opencv-python"]
     try:
         import PIL, numpy, cv2
     except ImportError:
-        print("\n[初始化] 正在同步依赖")
+        print("\n[初始化] 正在同步依赖...")
+        libs = ["pillow", "numpy", "opencv-python"]
         for lib in libs:
-            subprocess.run([sys.executable, "-m", "pip", "install", lib, "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"], capture_output=True)
-        print("[完成] 环境就绪\n")
-        os.execv(sys.executable, ['python'] + sys.argv)
+            subprocess.run([sys.executable, "-m", "pip", "install", lib, "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[完成] 环境就绪，正在启动...\n")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 if __name__ == "__main__" and "SKIP_BOOT" not in os.environ:
     os.environ["SKIP_BOOT"] = "1"
@@ -47,10 +47,8 @@ class Config:
 class Painter:
     def __init__(self):
         self.cfg = Config('zyf_config.json')
-        self.frame_cache = []
 
     def _init_video(self, w, h):
-        self.frame_cache = []
         if not self.cfg['视频']: return None, 0, 0
         dims = {'4K': 2160, '2K': 1440, '1080P': 1080, '720P': 720}
         th = dims.get(self.cfg['质量'], 1080)
@@ -58,10 +56,12 @@ class Painter:
         out = cv2.VideoWriter("视频回放.mp4", cv2.VideoWriter_fourcc(*'mp4v'), self.cfg['帧率'], (vw, vh))
         return out, vw, vh
 
-    def _write_frame(self, img, vw, vh):
+    def _write_frame(self, video, img, vw, vh):
+        if video is None: return
         f = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        if f.shape[1] != vw or f.shape[0] != vh: f = cv2.resize(f, (vw, vh))
-        self.frame_cache.append(f)
+        if f.shape[1] != vw or f.shape[0] != vh:
+            f = cv2.resize(f, (vw, vh))
+        video.write(f)
 
     def run(self, path, mode='art'):
         start_t = time.time()
@@ -72,18 +72,10 @@ class Painter:
         video, vw, vh = self._init_video(w, h)
 
         if mode == 'art':
-            print("提取数据")
+            print("正在分析")
             flat = pix.reshape(-1, 3)
-            uints = flat[:,0].astype(np.uint32) << 16 | flat[:,1].astype(np.uint32) << 8 | flat[:,2].astype(np.uint32)
-            unq, inv = np.unique(uints, return_inverse=True)
-
-            lums = 0.299 * ((unq >> 16) & 0xFF) + 0.587 * ((unq >> 8) & 0xFF) + 0.114 * (unq & 0xFF)
-            order = np.argsort(lums)
-
-            rank_map = np.zeros(len(unq), dtype=np.uint32)
-            rank_map[order] = np.arange(len(unq))
-            pixel_ranks = rank_map[inv]
-            sorted_pixel_indices = np.argsort(pixel_ranks)
+            lums = flat.dot([0.299, 0.587, 0.114])
+            sorted_pixel_indices = np.argsort(lums)
 
             flat_canvas = canvas.reshape(-1, 3)
             steps = 100
@@ -94,21 +86,24 @@ class Painter:
 
                 flat_canvas[idx_slice] = flat[idx_slice]
 
-                if video: self._write_frame(canvas, vw, vh)
+                if video: self._write_frame(video, canvas, vw, vh)
                 sys.stdout.write(f"\r进度: {(i+1):.1f}%"); sys.stdout.flush()
         else:
-            print("提取数据")
+            print("正在扫描")
             steps = 60
             for i in range(steps):
                 y_start = int(i * h / steps)
                 y_end = int((i + 1) * h / steps)
                 canvas[y_start:y_end, :] = pix[y_start:y_end, :]
-                if video: self._write_frame(canvas, vw, vh)
+                if video: self._write_frame(video, canvas, vw, vh)
                 sys.stdout.write(f"\r进度: {(i+1)/steps*100:.1f}%"); sys.stdout.flush()
 
         if video:
-            for f in self.frame_cache: video.write(f)
-            for _ in range(self.cfg['帧率']): video.write(self.frame_cache[-1])
+            last_frame = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+            if last_frame.shape[1] != vw or last_frame.shape[0] != vh:
+                last_frame = cv2.resize(last_frame, (vw, vh))
+            for _ in range(self.cfg['帧率']):
+                video.write(last_frame)
             video.release()
         Image.fromarray(canvas).save("预览图.png")
         print(f"\n\n分析完成，耗时: {time.time()-start_t:.2f} 秒")
